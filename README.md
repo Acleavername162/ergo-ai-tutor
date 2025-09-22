@@ -21,3 +21,6 @@ An AI-powered educational platform with Ollama backend.
 The API will be available at http://localhost:8000
 
 Ready to integrate with your frontend! 🚀
+=======
+# ergo-ai-tutor
+4f7d72874b83aec07faf53436cf4d6df941e1ff4
