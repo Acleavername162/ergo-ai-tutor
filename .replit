@@ -1,0 +1,24 @@
+run = "python3 server.py"
+language = "python3"
+
+[packager]
+language = "python3"
+ignoredPackages = ["unit_tests"]
+
+[packager.features]
+enabledForHosting = false
+packageSearch = true
+guessImports = true
+
+[languages.python3]
+pattern = "**/*.py"
+
+[env]
+PYTHONPATH = "${REPO_ROOT}"
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.1"
+PORT = "8000"
+HOST = "0.0.0.0"
+
+[deployment]
+run = ["sh", "-c", "python3 server.py"]

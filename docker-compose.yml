@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  ergo-ai-platform:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_URL=http://localhost:11434
+      - OLLAMA_MODEL=llama3.1
+      - PLATFORM_DB_PATH=/app/data/platform.db
+      - PORT=8000
+      - HOST=0.0.0.0
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
