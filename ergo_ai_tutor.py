@@ -46,9 +46,14 @@ class UserProfile:
 
 class OllamaAIBackend:
     def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama3.1"):
-        self.base_url = os.getenv("OLLAMA_URL", base_url)
+        # Prefer env vars; fall back to defaults
+        self.base_url = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_BASE_URL", base_url)
         self.model = os.getenv("OLLAMA_MODEL", model)
-        self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "30"))
+        # Longer timeout for CPU hosts to avoid read timeouts
+        self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+        # Generation controls (Ollama uses num_predict, not max_tokens)
+        self.num_predict = int(os.getenv("OLLAMA_MAX_TOKENS", "256"))
+        self.temperature = float(os.getenv("OLLAMA_TEMP", "0.4"))
         self.conversation_history = {}
     
     async def _post(self, url, json_data, timeout):
@@ -66,10 +71,11 @@ class OllamaAIBackend:
                         "prompt": full_prompt,
                         "stream": False,
                         "options": {
-                            "temperature": 0.7,
+                            "temperature": self.temperature,
                             "top_p": 0.9,
-                            "max_tokens": 1000
-                        }
+                            "num_predict": self.num_predict
+                        },
+                        "keep_alive": "5m"
                     },
                     self.timeout
                 )
@@ -88,6 +94,7 @@ class OllamaAIBackend:
                     print(f"Ollama API Error after 3 attempts: {e}")
                     return "I'm experiencing some technical difficulties. Please try again."
                 
+                # backoff: 0.5s, 1s, 2s
                 await asyncio.sleep(0.5 * (2 ** attempt))
         
         return "I'm having trouble connecting right now. Let's try again!"
