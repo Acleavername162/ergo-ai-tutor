@@ -4,3 +4,9 @@ __pycache__/
 venv/
 .venv/
 *.log
+
+# local ignores
+*.bak
+.env
+venv/
+__pycache__/
