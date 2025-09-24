@@ -1,22 +1,27 @@
+from __future__ import annotations
+
 import os
-import time
 import asyncio
 import json
 import requests
 import re
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
+import string
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass, asdict, field
 from enum import Enum
-import random
-from datetime import datetime, timedelta
-import hashlib
-import uuid
+from datetime import datetime
+
+
+# -----------------------------
+# Domain models
+# -----------------------------
 
 class LearningStyle(Enum):
     VISUAL = "visual"
     AUDITORY = "auditory"
     KINESTHETIC = "kinesthetic"
     READING = "reading"
+
 
 class DifficultyLevel(Enum):
     BEGINNER = 1
@@ -25,12 +30,14 @@ class DifficultyLevel(Enum):
     ADVANCED = 4
     EXPERT = 5
 
+
 class SubjectType(Enum):
     MATH = "mathematics"
     SCIENCE = "science"
     ENGLISH = "english"
     HISTORY = "history"
     PROGRAMMING = "programming"
+
 
 @dataclass
 class UserProfile:
@@ -44,6 +51,7 @@ class UserProfile:
     current_subjects: List[str]
     progress: Dict[str, Dict]
 
+
 @dataclass
 class Lesson:
     lesson_id: str
@@ -52,9 +60,10 @@ class Lesson:
     title: str
     grade_level: int
     difficulty: DifficultyLevel
-    content: Dict
+    content: Dict[str, Any]
     prerequisites: List[str]
     learning_objectives: List[str]
+
 
 @dataclass
 class FlashCard:
@@ -65,6 +74,7 @@ class FlashCard:
     subject: SubjectType
     hints: List[str]
 
+
 @dataclass
 class TutoringSession:
     user_id: str
@@ -73,25 +83,33 @@ class TutoringSession:
     start_time: datetime
     last_interaction: datetime
 
-class OllamaAIBackend:
-    """Core Ollama integration for Ergo AI Tutor"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:11434", model: str = "llama3.1:8b-instruct-q4_K_M"):
-        # prefer env values
-        self.base_url = os.getenv("OLLAMA_URL", os.getenv("OLLAMA_BASE_URL", base_url))
+# -----------------------------
+# Ollama backend
+# -----------------------------
+
+class OllamaAIBackend:
+    """Core Ollama integration for Ergo AI Tutor."""
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:11434",
+        model: str = "llama3.1:8b-instruct-q4_K_M",
+    ) -> None:
+        self.base_url = os.getenv("OLLAMA_URL", os.getenv("OLLAMA_BASE_URL", base_url)).rstrip("/")
         self.model = os.getenv("OLLAMA_MODEL", model)
         self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "60"))
-        self.max_tokens = int(os.getenv("OLLAMA_MAX_TOKENS", "500"))  # -> num_predict
+        self.max_tokens = int(os.getenv("OLLAMA_MAX_TOKENS", "500"))
         self.temperature = float(os.getenv("OLLAMA_TEMP", "0.7"))
+        # conversation_history: user_id -> List[ {timestamp, question, answer} ]
         self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
 
     def _extract_first_json_block(self, text: str) -> Optional[dict]:
-        """Extract JSON from LLM response if present"""
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
         blob = m.group(1) if m else None
         if not blob:
             start, end = text.find("{"), text.rfind("}")
-            blob = text[start:end+1] if (start != -1 and end > start) else None
+            blob = text[start : end + 1] if (start != -1 and end > start) else None
         if not blob:
             return None
         try:
@@ -99,14 +117,60 @@ class OllamaAIBackend:
         except Exception:
             return None
 
-    async def _post(self, url, json_data, timeout):
-        """Non-blocking HTTP POST wrapper"""
+    async def _post(self, url: str, json_data: Dict[str, Any], timeout: int):
+        # run requests.post in a thread to avoid blocking the event loop
         return await asyncio.to_thread(requests.post, url, json=json_data, timeout=timeout)
 
-    async def chat(self, prompt: str, user_id: str, context: Optional[Dict] = None) -> str:
-        """Context-aware chat with retries"""
-        full_prompt = self._build_context_prompt(prompt, user_id, context)
+    def _build_context_prompt(self, prompt: str, user_id: str, context: Optional[Dict[str, Any]]) -> str:
+        base_personality = (
+            "You are Ergo, an AI tutor inspired by Albert Einstein.\n"
+            "STYLE:\n"
+            "- Patient, encouraging, never condescending\n"
+            "- Keep answers brief (2–3 sentences)\n"
+            "- Step-by-step with simple language\n"
+            "- End with a quick check-for-understanding question\n\n"
+            "FOCUS:\n"
+            "- Stay on the current subject & subtopic\n"
+            "- If off-topic: acknowledge, then gently redirect; mention /switch\n"
+        )
 
+        current_context = ""
+        if context:
+            current_context = (
+                "CURRENT LESSON CONTEXT:\n"
+                f"- Subject: {context.get('subject','')}\n"
+                f"- Subtopic: {context.get('subtopic','')}\n"
+                f"- Lesson: {context.get('current_lesson','')}\n"
+                "- Keep responses focused on this topic\n"
+            )
+
+        history = self._get_recent_history(user_id, limit=3)
+        history_text = "\n".join([f"Student: {h['question']}\nErgo: {h['answer']}" for h in history]) or "(no recent turns)"
+
+        full_prompt = (
+            f"{base_personality}\n"
+            f"{current_context}\n"
+            f"RECENT CONVERSATION:\n{history_text}\n\n"
+            f"CURRENT STUDENT INPUT: {prompt}\n\n"
+            f"Respond as Ergo with a brief, focused answer:"
+        )
+        return full_prompt
+
+    def _update_conversation_history(self, user_id: str, question: str, answer: str) -> None:
+        self.conversation_history.setdefault(user_id, []).append({
+            "timestamp": datetime.now().isoformat(),
+            "question": question,
+            "answer": answer,
+        })
+        if len(self.conversation_history[user_id]) > 3:
+            self.conversation_history[user_id] = self.conversation_history[user_id][-3:]
+
+    def _get_recent_history(self, user_id: str, limit: int = 3) -> List[Dict[str, str]]:
+        return self.conversation_history.get(user_id, [])[-limit:]
+
+    async def chat(self, prompt: str, user_id: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """Main chat interface with context awareness, non-blocking calls and retry logic."""
+        full_prompt = self._build_context_prompt(prompt, user_id, context)
         for attempt in range(3):
             try:
                 response = await self._post(
@@ -118,220 +182,177 @@ class OllamaAIBackend:
                         "options": {
                             "temperature": self.temperature,
                             "top_p": 0.9,
-                            "num_predict": self.max_tokens
+                            "num_predict": self.max_tokens,
                         },
-                        "keep_alive": "5m"
+                        "keep_alive": "5m",
                     },
-                    self.timeout
+                    self.timeout,
                 )
-
                 if response.status_code == 200:
                     result = response.json()
-                    ai_response = result.get("response", "")
+                    ai_response = (result.get("response") or "").strip()
+                    if not ai_response:
+                        ai_response = "I’m here—try asking that again with a bit more detail."
                     self._update_conversation_history(user_id, prompt, ai_response)
                     return ai_response
-                else:
-                    if attempt == 2:
-                        return "I'm experiencing a hiccup. Try asking again or type /switch <subject> : <subtopic>."
+                # non-200 → fall through to retry
             except Exception:
-                if attempt == 2:
-                    return "I'm experiencing a hiccup. Try asking again or type /switch <subject> : <subtopic>."
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2**attempt))
 
-        return "I'm experiencing a hiccup. Try asking again or type /switch <subject> : <subtopic>."
+        return "I'm having a small hiccup or trouble connecting. Please try again, or type /switch <subject> : <subtopic>."
 
-    def _build_context_prompt(self, prompt: str, user_id: str, context: Optional[Dict] = None) -> str:
-        base_personality = '''You are Ergo, an AI tutor inspired by Albert Einstein.
 
-TEACHING STYLE:
-- Patient and encouraging, never condescending
-- Brief responses (2–3 sentences max) – no long monologues
-- Step-by-step explanations using simple language
-- Always check for understanding with a quick question
-
-FOCUS DISCIPLINE:
-- Stay laser-focused on the current subject and subtopic
-- If asked off-topic, acknowledge briefly then redirect: "That's interesting! Let's focus on [current subtopic] for now. Type /switch to change."
-- Prioritize depth over breadth in the current lesson
-
-TEACHING RHYTHM:
-1) Explain the core principle simply
-2) Give a tiny, concrete example
-3) Ask a check-for-understanding question
-4) Connect to real-world application when relevant
-
-SAFETY & BOUNDARIES:
-- Refuse harmful/illicit requests politely
-- Never reveal chain-of-thought
-- Stay educational and age-appropriate'''
-
-        current_context = ""
-        if context:
-            current_lesson = context.get("current_lesson", "")
-            subject = context.get("subject", "")
-            subtopic = context.get("subtopic", "")
-            current_context = f"""
-CURRENT LESSON CONTEXT:
-- Subject: {subject}
-- Subtopic: {subtopic}
-- Lesson: {current_lesson}
-- Keep responses focused on this topic"""
-
-        history = self._get_recent_history(user_id, limit=3)
-        history_text = "\n".join([f"Student: {h['user']}\nErgo: {h['assistant']}" for h in history])
-
-        full_prompt = f"""{base_personality}
-
-{current_context}
-
-RECENT CONVERSATION:
-{history_text}
-
-CURRENT STUDENT INPUT: {prompt}
-
-Respond as Ergo with a brief, focused answer:"""
-        return full_prompt
-
-    def _update_conversation_history(self, user_id: str, user_msg: str, ai_response: str):
-        if user_id.startswith("ergo_"):
-            return
-        if user_id not in self.conversation_history:
-            self.conversation_history[user_id] = []
-        self.conversation_history[user_id].append({
-            "timestamp": datetime.now().isoformat(),
-            "user": user_msg,
-            "assistant": ai_response
-        })
-        if len(self.conversation_history[user_id]) > 3:
-            self.conversation_history[user_id] = self.conversation_history[user_id][-3:]
-
-    def _get_recent_history(self, user_id: str, limit: int = 3) -> List[Dict]:
-        if user_id not in self.conversation_history:
-            return []
-        return self.conversation_history[user_id][-limit:]
+# -----------------------------
+# Tutor orchestrator
+# -----------------------------
 
 class ErgoAITutor:
-    """Main Ergo AI Tutor class with input router and robust handling"""
+    """Main Ergo AI Tutor class with input router and robust handling."""
 
-    def __init__(self):
-        self.ollama = OllamaAIBackend()
+    def __init__(self) -> None:
+        # Tests expect this name:
+        self.ai_backend = OllamaAIBackend()
         self.active_sessions: Dict[str, TutoringSession] = {}
 
+    # ---------- helpers ----------
+
     def _is_short(self, text: str) -> bool:
-        tokens = text.strip().split()
-        return len(tokens) <= 2 and "?" not in text
+        tokens = (text or "").strip().split()
+        return len(tokens) <= 2 and "?" not in (text or "")
+
+    def _normalize_tokens(self, text: str) -> set[str]:
+        text = (text or "").lower().translate(str.maketrans("", "", string.punctuation))
+        return set(text.split())
 
     def _is_off_topic(self, text: str, subject: str, subtopic: str) -> bool:
-        """Conservative off-topic check:
-           - Never mark short (≤2 tokens) as off-topic.
-           - Otherwise, require zero overlap with subject/subtopic tokens.
-        """
-        t = set(re.findall(r"\w+", text.lower()))
-        if len(t) <= 2:
-            return False
-        s = set(re.findall(r"\w+", str(subject).lower()))
-        u = set(re.findall(r"\w+", str(subtopic).lower()))
-        return len(t & (s | u)) == 0
+        text_tokens = self._normalize_tokens(text)
+        subject_tokens = self._normalize_tokens(subject)
+        subtopic_tokens = self._normalize_tokens(subtopic)
+        return len(text_tokens & (subject_tokens | subtopic_tokens)) == 0
+
+    def _subject_to_str(self, subject: Union[SubjectType, str]) -> str:
+        if isinstance(subject, SubjectType):
+            return subject.value
+        return str(subject).strip().lower()
 
     def _handle_command(self, command: str, user_id: str) -> Dict[str, Any]:
-        command = command.strip()
+        command = (command or "").strip()
 
         if command == "/help":
             return {
                 "success": True,
-                "answer": "Available commands:\n• /switch <subject> : <subtopic>\n• /help\n\nExample: /switch mathematics : fractions"
+                "answer": (
+                    "Available commands:\n"
+                    "• /switch <subject> : <subtopic> – Change your topic\n"
+                    "• /help – Show this help\n\n"
+                    "Example: /switch mathematics : fractions"
+                ),
             }
 
         if command.startswith("/switch "):
-            try:
-                parts = command[8:].split(" : ")
-                if len(parts) != 2:
-                    return {
-                        "success": True,
-                        "answer": "Use: /switch <subject> : <subtopic>\nExample: /switch mathematics : fractions"
-                    }
-                subject = parts[0].strip()
-                subtopic = parts[1].strip()
-                self.active_sessions[user_id] = TutoringSession(
-                    user_id=user_id,
-                    subject=subject,
-                    subtopic=subtopic,
-                    start_time=datetime.now(),
-                    last_interaction=datetime.now()
-                )
+            parts = command[8:].split(" : ")
+            if len(parts) != 2:
                 return {
                     "success": True,
-                    "answer": f"Switched to {subject} : {subtopic}. What would you like to learn about this topic?"
+                    "answer": (
+                        "Use format: /switch <subject> : <subtopic>\n"
+                        "Example: /switch mathematics : fractions"
+                    ),
                 }
-            except Exception:
-                return {
-                    "success": True,
-                    "answer": "Use: /switch <subject> : <subtopic>\nExample: /switch mathematics : fractions"
-                }
+            subject = parts[0].strip()
+            subtopic = parts[1].strip()
 
-        return {
-            "success": True,
-            "answer": "Unknown command. Type /help to see available commands."
-        }
+            self.active_sessions[user_id] = TutoringSession(
+                user_id=user_id,
+                subject=subject,
+                subtopic=subtopic,
+                start_time=datetime.now(),
+                last_interaction=datetime.now(),
+            )
+            return {
+                "success": True,
+                "answer": f"Switched to {subject} : {subtopic}. What would you like to learn?",
+            }
 
-    async def start_tutoring_session(self, user_profile: UserProfile, subject, subtopic: str) -> Dict:
-        """Start a new session (replaces any existing session for this user)."""
-        subj_value = subject.value if isinstance(subject, SubjectType) else str(subject)
+        return {"success": True, "answer": "Unknown command. Type /help to see available commands."}
 
+    # ---------- public API ----------
+
+    async def start_tutoring_session(
+        self,
+        user_profile: UserProfile,
+        subject: Union[SubjectType, str],
+        subtopic: str,
+    ) -> Dict[str, Any]:
+        """Start a new tutoring session - replaces any existing session for this user."""
+        subject_str = self._subject_to_str(subject)
         self.active_sessions[user_profile.user_id] = TutoringSession(
             user_id=user_profile.user_id,
-            subject=subj_value,
+            subject=subject_str,
             subtopic=subtopic,
             start_time=datetime.now(),
-            last_interaction=datetime.now()
+            last_interaction=datetime.now(),
         )
 
+        # build welcome via LLM but tolerate errors
         welcome_prompt = (
-            f"Welcome {user_profile.name} to learning about {subtopic} in {subj_value}! "
+            f"Welcome {user_profile.name} to learning about {subtopic} in {subject_str}! "
             f"Introduce yourself as Ergo and ask what they'd like to start with."
         )
-
         try:
-            welcome_message = await self.ollama.chat(
+            welcome_message = await self.ai_backend.chat(
                 welcome_prompt,
                 user_profile.user_id,
                 context={
                     "current_lesson": subtopic,
-                    "subject": subj_value,
-                    "subtopic": subtopic
-                }
+                    "subject": subject_str,
+                    "subtopic": subtopic,
+                },
             )
         except Exception:
             welcome_message = (
                 f"Hello {user_profile.name}! I'm Ergo, your AI tutor. "
-                f"Let's explore {subtopic} in {subj_value}! What would you like to learn first?"
+                f"Let's explore {subtopic} together. What would you like to start with?"
             )
 
-        return {
-            "session_context": {
-                "user_id": user_profile.user_id,
-                "current_subject": subj_value,
-                "subtopic": subtopic,
-                "progress": 0,
-                "start_time": datetime.now().isoformat()
-            },
-            "welcome_message": welcome_message,
-            "session_id": user_profile.user_id
+        # session_context shape expected by tests
+        session = self.active_sessions[user_profile.user_id]
+        session_context = {
+            "session_id": user_profile.user_id,
+            "current_subject": session.subject,
+            "current_subtopic": session.subtopic,
+            "session_start": session.start_time.isoformat(),
+            "last_activity": session.last_interaction.isoformat(),
+            "user_profile": self._profile_to_public(user_profile),
         }
+        return {"session_context": session_context, "welcome_message": welcome_message}
 
     async def handle_student_question(self, user_id: str, question: str) -> Dict[str, Any]:
-        """Handle student inputs robustly; never throws."""
+        """Handle student questions with input router - never throws exceptions."""
         try:
             if user_id not in self.active_sessions:
                 return {
                     "success": True,
-                    "answer": "Hi! I'm Ergo, your AI tutor.\nTry: /switch mathematics : addition  or  /switch science : atoms\nWhat subject interests you?"
+                    "answer": (
+                        "Hi! I'm Ergo, your AI tutor. Let's get you started.\n\n"
+                        "Try: /switch mathematics : addition\n"
+                        "Or: /switch science : atoms\n\n"
+                        "What subject interests you?"
+                    ),
                 }
 
             session = self.active_sessions[user_id]
             session.last_interaction = datetime.now()
 
-            question = question.strip()
+            question = (question or "").strip()
+            if not question:
+                return {
+                    "success": True,
+                    "answer": (
+                        f"Tell me something specific about {session.subtopic}, "
+                        "or type /help for options."
+                    ),
+                }
 
             if question.startswith("/"):
                 return self._handle_command(question, user_id)
@@ -339,34 +360,64 @@ class ErgoAITutor:
             if self._is_short(question):
                 return {
                     "success": True,
-                    "answer": f"Let's dive deeper into {session.subtopic}! Try a specific question, or type /switch to change topics. What would you like to practice?"
+                    "answer": (
+                        f"Let’s dive deeper into {session.subtopic}. "
+                        "Ask a specific question or type /switch to change topics. "
+                        "What would you like to practice?"
+                    ),
                 }
 
             if self._is_off_topic(question, session.subject, session.subtopic):
                 return {
                     "success": True,
-                    "answer": f"Interesting! We're focusing on {session.subtopic} in {session.subject}. "
-                              f"Ask something about this, or type /switch <subject> : <subtopic> to change."
+                    "answer": (
+                        f"That's interesting! Right now we're focusing on {session.subtopic} in {session.subject}. "
+                        f"Let’s keep focusing on this topic for now, or type /switch <subject> : <subtopic> to change topics."
+                    ),
                 }
 
+            # On-topic → call LLM
             try:
-                response = await self.ollama.chat(
+                response = await self.ai_backend.chat(
                     question,
                     user_id,
                     context={
                         "current_lesson": session.subtopic,
                         "subject": session.subject,
-                        "subtopic": session.subtopic
-                    }
+                        "subtopic": session.subtopic,
+                    },
                 )
                 return {"success": True, "answer": response}
             except Exception:
-                return {"success": True, "answer": "I'm experiencing a hiccup. Try again or /switch <subject> : <subtopic>."}
-
+                return {
+                    "success": True,
+                    "answer": "I'm experiencing a hiccup or trouble connecting. Try again, or type /switch <subject> : <subtopic>.",
+                }
         except Exception:
-            return {"success": True, "answer": "I'm experiencing a hiccup. Try again or /switch <subject> : <subtopic>."}
+            return {
+                "success": True,
+                "answer": "I'm experiencing a hiccup or trouble connecting. Try again, or type /switch <subject> : <subtopic>.",
+            }
+
+    def get_session_status(self, user_id: str) -> Dict[str, Any]:
+        """Small helper your tests rely on."""
+        s = self.active_sessions.get(user_id)
+        if not s:
+            return {
+                "current_subject": None,
+                "current_subtopic": None,
+                "session_start": None,
+                "last_activity": None,
+            }
+        return {
+            "current_subject": s.subject,
+            "current_subtopic": s.subtopic,
+            "session_start": s.start_time.isoformat(),
+            "last_activity": s.last_interaction.isoformat(),
+        }
 
     async def generate_practice_flashcard(self, user_id: str) -> Optional[FlashCard]:
+        """Generate a practice flashcard for current lesson (placeholder)."""
         if user_id not in self.active_sessions:
             return None
         session = self.active_sessions[user_id]
@@ -376,35 +427,27 @@ class ErgoAITutor:
             explanation=f"This relates to {session.subject} and specifically {session.subtopic}",
             difficulty=DifficultyLevel.BEGINNER,
             subject=SubjectType.MATH,
-            hints=["Think about the basics", "Consider the fundamentals"]
+            hints=["Think about the basics", "Consider the fundamentals"],
         )
 
-# Example usage
-async def main():
-    ergo = ErgoAITutor()
-    user_profile = UserProfile(
-        user_id="student_123",
-        name="Alex",
-        grade_level=6,
-        learning_style=LearningStyle.VISUAL,
-        mbti_type="ENFP",
-        strengths=["problem_solving", "creativity"],
-        weaknesses=["attention_to_detail"],
-        current_subjects=["mathematics"],
-        progress={}
-    )
+    # ---------- utilities ----------
 
-    print("Starting Enhanced Ergo AI Tutor Demo...")
-    session = await ergo.start_tutoring_session(user_profile, SubjectType.MATH, "Basic Addition")
-    print(f"Welcome Message: {session['welcome_message']}")
+    def _profile_to_public(self, profile: UserProfile) -> Dict[str, Any]:
+        """Serialize UserProfile with enum values expanded."""
+        data = asdict(profile)
+        data["learning_style"] = profile.learning_style.value
+        # Keep everything else as-is
+        return data
 
-    test_inputs = ["hi", "What's your favorite color?", "/help", "/switch science : atoms", "How do atoms work?"]
-    for test_input in test_inputs:
-        print(f"\nStudent: {test_input}")
-        response = await ergo.handle_student_question(user_profile.user_id, test_input)
-        print(f"Ergo: {response['answer']}")
 
-    print("\nEnhanced Ergo AI Tutor demo complete!")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+__all__ = [
+    "LearningStyle",
+    "DifficultyLevel",
+    "SubjectType",
+    "UserProfile",
+    "Lesson",
+    "FlashCard",
+    "TutoringSession",
+    "OllamaAIBackend",
+    "ErgoAITutor",
+]
