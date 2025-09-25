@@ -21,13 +21,15 @@ app = FastAPI(
 # --- CORS: allow your domain + Replit previews ---
 ALLOWED_ORIGINS = [
     "https://ai.therisehub.org",
+    "http://localhost:3000",
+    "http://localhost:5173",
 ]
 # Regex to allow any *.replit.app origin
 ALLOWED_ORIGIN_REGEX = r"^https:\/\/[a-zA-Z0-9-]+\.replit\.app$"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
@@ -36,6 +38,7 @@ app.add_middleware(
 
 ergo = ErgoAITutor()
 rate_limit_store: Dict[str, int] = {}
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 
 # ---------- Models ----------
 class UserProfileRequest(BaseModel):
@@ -59,7 +62,7 @@ class QuestionRequest(BaseModel):
     question: str
 
 # ---------- Helpers ----------
-def check_rate_limit(user_id: str, limit_per_minute: int = 30) -> bool:
+def check_rate_limit(user_id: str, limit_per_minute: int = RATE_LIMIT_PER_MIN) -> bool:
     current_minute = int(time.time() / 60)
     key = f"{user_id}_{current_minute}"
     rate_limit_store[key] = rate_limit_store.get(key, 0) + 1
@@ -87,11 +90,13 @@ def parse_enum(enum_cls: Type[T], value: str) -> Optional[T]:
 # ---------- Middleware ----------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Skip health + preflight
+    # Skip health and preflight
     if request.url.path == "/health" or request.method == "OPTIONS":
         return await call_next(request)
 
-    user_id = request.headers.get("X-User-ID") or "anonymous"
+    # Respect X-User-ID forwarded by Nginx; fallback to IP or "anonymous"
+    user_id = request.headers.get("X-User-ID") or request.client.host or "anonymous"
+
     if not check_rate_limit(user_id):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again in a minute.")
 
@@ -148,6 +153,7 @@ async def get_system_stats():
             "active_sessions": len(ergo.active_sessions),
             "conversation_history_users": len(ergo.ai_backend.conversation_history),
             "rate_limit_entries": len(rate_limit_store),
+            "rate_limit_per_min": RATE_LIMIT_PER_MIN,
             "timestamp": datetime.now().isoformat(),
         }
     except Exception:
@@ -156,6 +162,7 @@ async def get_system_stats():
             "active_sessions": len(ergo.active_sessions),
             "conversation_history_users": "unknown",
             "rate_limit_entries": len(rate_limit_store),
+            "rate_limit_per_min": RATE_LIMIT_PER_MIN,
             "timestamp": datetime.now().isoformat(),
         }
 
