@@ -1,27 +1,66 @@
 FROM python:3.11-slim
 
+# Use bash with pipefail for safer installs
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 WORKDIR /app
 
-# Install system dependencies
+# -------- System deps --------
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# -------- Python deps --------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# -------- App code --------
 COPY . .
 
-# Install Ollama
+# Make the system prompt path explicit (your code will auto-read this)
+ENV ERGO_SYSTEM_PROMPT_PATH=/app/ergo_system_prompt.txt
+
+# Ollama + tutor defaults (match your backend)
+ENV OLLAMA_URL=http://127.0.0.1:11434 \
+    OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M \
+    OLLAMA_TIMEOUT=60 \
+    OLLAMA_MAX_TOKENS=500 \
+    OLLAMA_TEMP=0.7
+
+# -------- Install Ollama in the image --------
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
-# Create startup script
-RUN echo '#!/bin/bash\nollama serve &\nsleep 10\nollama pull llama3.1\npython3 server_platform.py' > /app/start.sh
-RUN chmod +x /app/start.sh
+# -------- Startup script --------
+# Waits for Ollama, pulls model if needed, then launches your server
+RUN printf '%s\n' \
+'#!/usr/bin/env bash' \
+'set -euo pipefail' \
+'' \
+'# Start Ollama in background' \
+'ollama serve &>/tmp/ollama.log &' \
+'' \
+'# Wait for Ollama HTTP to be available' \
+'for i in {1..30}; do' \
+'  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then' \
+'    break' \
+'  fi' \
+'  sleep 1' \
+'done' \
+'' \
+'# Pull the configured model (idempotent)' \
+'MODEL="${OLLAMA_MODEL:-llama3.1:8b-instruct-q4_K_M}"' \
+'ollama pull "$MODEL" || true' \
+'' \
+'# Launch FastAPI app (server_platform.py in your repo)' \
+'exec python3 server_platform.py' \
+> /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 8000
+
+# Optional container healthcheck against your /health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:8000/health || exit 1
 
 CMD ["/app/start.sh"]
