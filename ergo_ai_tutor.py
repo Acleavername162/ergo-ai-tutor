@@ -245,6 +245,21 @@ class ErgoAITutor:
         self.ai_backend = OllamaAIBackend()
         self.active_sessions: Dict[str, TutoringSession] = {}
 
+    # ---------- NEW: compatibility wrapper for API /tutor/question ----------
+    async def get_answer(self, question: str, model: Optional[str] = None, user_id: str = "anonymous") -> str:
+        """
+        Compatibility shim used by server.py. Optionally override the model for this call,
+        then delegate to the backend chat while preserving the previous model setting.
+        """
+        prev_model = self.ai_backend.model
+        try:
+            if model:
+                self.ai_backend.model = model
+            return await self.ai_backend.chat(question=question, user_id=user_id, context=None)
+        finally:
+            # restore whatever the backend was using before
+            self.ai_backend.model = prev_model
+
     # ---------- helpers ----------
 
     def _is_short(self, text: str) -> bool:
