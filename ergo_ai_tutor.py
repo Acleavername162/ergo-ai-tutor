@@ -10,6 +10,46 @@ from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 from datetime import datetime
+from pathlib import Path  # <-- added
+
+# --- System prompt loading ---
+_DEFAULT_PROMPT = (
+    "You are Ergo, an AI tutor inspired by Albert Einstein. "
+    "Keep answers brief (2–3 sentences), step-by-step, encouraging, and always end with a quick check question. "
+    "Stay on the current subject/subtopic; gently redirect off-topic and mention /switch."
+)
+
+_PROMPT_CACHE: Optional[str] = None
+
+def get_system_prompt() -> str:
+    """Load prompt from file or env once; fallback to a safe default."""
+    global _PROMPT_CACHE
+    if _PROMPT_CACHE:
+        return _PROMPT_CACHE
+
+    # Allow override via env var
+    override = os.getenv("ERGO_SYSTEM_PROMPT_PATH")
+    search_order = []
+    if override:
+        search_order.append(Path(override))
+    # next to this file (repo root if file lives there)
+    search_order.append(Path(__file__).with_name("ergo_system_prompt.txt"))
+    # current working dir (just in case)
+    search_order.append(Path.cwd() / "ergo_system_prompt.txt")
+
+    for p in search_order:
+        try:
+            if p.exists():
+                txt = p.read_text(encoding="utf-8").strip()
+                if txt:
+                    _PROMPT_CACHE = txt
+                    return _PROMPT_CACHE
+        except Exception:
+            # ignore read errors and keep searching
+            pass
+
+    _PROMPT_CACHE = _DEFAULT_PROMPT
+    return _PROMPT_CACHE
 
 
 # -----------------------------
@@ -122,17 +162,8 @@ class OllamaAIBackend:
         return await asyncio.to_thread(requests.post, url, json=json_data, timeout=timeout)
 
     def _build_context_prompt(self, prompt: str, user_id: str, context: Optional[Dict[str, Any]]) -> str:
-        base_personality = (
-            "You are Ergo, an AI tutor inspired by Albert Einstein.\n"
-            "STYLE:\n"
-            "- Patient, encouraging, never condescending\n"
-            "- Keep answers brief (2–3 sentences)\n"
-            "- Step-by-step with simple language\n"
-            "- End with a quick check-for-understanding question\n\n"
-            "FOCUS:\n"
-            "- Stay on the current subject & subtopic\n"
-            "- If off-topic: acknowledge, then gently redirect; mention /switch\n"
-        )
+        # Pull system voice from file/env with default fallback
+        base_personality = get_system_prompt()
 
         current_context = ""
         if context:
@@ -148,7 +179,7 @@ class OllamaAIBackend:
         history_text = "\n".join([f"Student: {h['question']}\nErgo: {h['answer']}" for h in history]) or "(no recent turns)"
 
         full_prompt = (
-            f"{base_personality}\n"
+            f"{base_personality}\n\n"
             f"{current_context}\n"
             f"RECENT CONVERSATION:\n{history_text}\n\n"
             f"CURRENT STUDENT INPUT: {prompt}\n\n"
