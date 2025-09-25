@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import requests  # <-- added
 
 from ergo_ai_tutor import ErgoAITutor, UserProfile, SubjectType, LearningStyle
 
@@ -40,6 +41,12 @@ ergo = ErgoAITutor()
 rate_limit_store: Dict[str, int] = {}
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 
+# Log Ollama env at boot (helps when debugging)
+print(
+    f"[BOOT] OLLAMA_URL={os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434')} "
+    f"OLLAMA_MODEL={os.getenv('OLLAMA_MODEL', 'llama3.1')}"
+)
+
 # ---------- Models ----------
 class UserProfileRequest(BaseModel):
     user_id: str
@@ -72,6 +79,7 @@ def check_rate_limit(user_id: str, limit_per_minute: int = RATE_LIMIT_PER_MIN) -
             del rate_limit_store[k]
     return rate_limit_store[key] <= limit_per_minute
 
+from typing import Type, TypeVar
 def parse_enum(enum_cls: Type[T], value: str) -> Optional[T]:
     """Case-insensitive enum parser by .value or .name; returns None if not found."""
     if value is None:
@@ -106,6 +114,26 @@ async def rate_limit_middleware(request: Request, call_next):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+# TEMP: prove app → Ollama connectivity and chosen model
+@app.get("/dev/ollama")
+def dev_ollama():
+    base = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.1")
+    try:
+        r = requests.post(
+            f"{base}/api/generate",
+            json={"model": model, "prompt": "One-word: pong", "stream": False},
+            timeout=15,
+        )
+        j = {}
+        try:
+            j = r.json()
+        except Exception:
+            j = {"raw": r.text[:500]}
+        return {"ok": True, "status": r.status_code, "model": model, "base": base, "json": j}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "model": model, "base": base}
 
 @app.post("/tutor/session/start")
 async def start_session(req: StartSessionRequest):
