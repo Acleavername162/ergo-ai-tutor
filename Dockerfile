@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+# Use GHCR mirror of the Python base image (avoids Docker Hub pulls)
+FROM ghcr.io/library/python:3.11-slim
 
 # Use bash with pipefail for safer installs
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -42,7 +43,7 @@ RUN printf '%s\n' \
 'ollama serve &>/tmp/ollama.log &' \
 '' \
 '# Wait for Ollama HTTP to be available' \
-'for i in {1..30}; do' \
+'for i in {1..60}; do' \
 '  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then' \
 '    break' \
 '  fi' \
@@ -53,13 +54,13 @@ RUN printf '%s\n' \
 'MODEL="${OLLAMA_MODEL:-llama3.1:8b-instruct-q4_K_M}"' \
 'ollama pull "$MODEL" || true' \
 '' \
-'# Launch FastAPI app (server_platform.py in your repo)' \
+'# Launch FastAPI app (adjust if your entry is different)' \
 'exec python3 server_platform.py' \
 > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 8000
 
-# Optional container healthcheck against your /health endpoint
+# Healthcheck against your /health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fsS http://localhost:8000/health || exit 1
 
