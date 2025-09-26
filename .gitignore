@@ -1,15 +1,32 @@
-# Python
+# --- Python caches ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Virtual environments ---
 .venv/
 venv/
+env/
 
-# Env & data
+# --- Local environment & secrets ---
 .env
 .env.*
+!.env.example
+
+# --- SQLite data & local files ---
 data/
 *.db
 
-# OS/editor
+# --- OS/editor cruft ---
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Build / dist ---
+build/
+dist/
+*.egg-info/
