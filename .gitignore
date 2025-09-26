@@ -1,12 +1,15 @@
-.env
+# Python
 __pycache__/
 *.pyc
-venv/
 .venv/
-*.log
-
-# local ignores
-*.bak
-.env
 venv/
-__pycache__/
+
+# Env & data
+.env
+.env.*
+data/
+*.db
+
+# OS/editor
+.DS_Store
+Thumbs.db
