@@ -9,8 +9,8 @@ import psutil
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
-from dotenv import load_dotenv
+from pydantic import BaseModel, field_validator  # pydantic v2
+from dotenv import load_dotenv  # <-- correct module name
 
 from ergo_ai_tutor import ErgoAITutor
 
@@ -23,54 +23,22 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# ---------- CORS ----------
+# CORS
 allowed_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-if not allowed_origins:
-    # Dev-safe fallback so local testing doesn't get blocked
-    allowed_origins = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=allowed_origins or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Rate limiting ----------
+# Simple in-memory rate limit
 rate_limit_store = defaultdict(list)
 RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW = 60  # seconds
 
 
-def check_rate_limit(user_id: str) -> bool:
-    """Simple in-memory fixed-window rate limiter."""
-    now = datetime.now()
-    cutoff = now - timedelta(seconds=RATE_LIMIT_WINDOW)
-
-    # drop old entries
-    rate_limit_store[user_id] = [t for t in rate_limit_store[user_id] if t > cutoff]
-
-    if len(rate_limit_store[user_id]) >= RATE_LIMIT_REQUESTS:
-        return False
-
-    rate_limit_store[user_id].append(now)
-    return True
-
-
-def get_user_id(request: Request) -> str:
-    return request.headers.get("X-User-ID", "anonymous")
-
-
-def rate_limit_dependency(request: Request):
-    # Skip preflight and health
-    if request.method == "OPTIONS" or request.url.path == "/health":
-        return
-    if not check_rate_limit(get_user_id(request)):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-
-# ---------- Subject enum ----------
 class SubjectType(str, Enum):
     MATH = "MATH"
     CS = "CS"
@@ -84,13 +52,12 @@ class SubjectType(str, Enum):
     SOCIAL_STUDIES = "SOCIAL_STUDIES"
 
 
-# ---------- Models ----------
 class QuestionRequest(BaseModel):
     user_id: str
     question: str
     subject: Optional[SubjectType] = None
-    level: Optional[str] = None      # e.g., "6th grade", "AP", "college"
-    model: Optional[str] = None      # per-request model override
+    level: Optional[str] = None
+    model: Optional[str] = None
 
     @field_validator("subject", mode="before")
     @classmethod
@@ -99,17 +66,18 @@ class QuestionRequest(BaseModel):
             return v
         if isinstance(v, str):
             v_upper = v.upper().replace(" ", "_")
-            for s in SubjectType:
-                if s.value == v_upper:
-                    return s
-            # Aliases
-            alias = {
+            # exact match
+            for subject in SubjectType:
+                if subject.value == v_upper:
+                    return subject
+            # aliases
+            aliases = {
                 "COMPUTER_SCIENCE": SubjectType.CS,
                 "ENGLISH": SubjectType.ELA,
                 "SOCIAL_STUDIES": SubjectType.SOCIAL,
-            }.get(v_upper)
-            if alias:
-                return alias
+            }
+            if v_upper in aliases:
+                return aliases[v_upper]
         return v
 
 
@@ -127,52 +95,78 @@ class SessionStartResponse(BaseModel):
     message: str
 
 
-# ---------- Model routing ----------
+def check_rate_limit(user_id: str) -> bool:
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=RATE_LIMIT_WINDOW)
+    # drop old
+    rate_limit_store[user_id] = [t for t in rate_limit_store[user_id] if t > cutoff]
+    if len(rate_limit_store[user_id]) >= RATE_LIMIT_REQUESTS:
+        return False
+    rate_limit_store[user_id].append(now)
+    return True
+
+
+def get_user_id(request: Request) -> str:
+    return request.headers.get("X-User-ID", "anonymous")
+
+
+def rate_limit_dependency(request: Request):
+    if request.method == "OPTIONS" or request.url.path == "/health":
+        return
+    user_id = get_user_id(request)
+    if not check_rate_limit(user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+
 def get_model_for_request(
     subject: Optional[SubjectType],
     level: Optional[str],
     model_override: Optional[str],
 ) -> str:
-    if model_override and model_override.strip():
-        return model_override.strip()
+    if model_override:
+        return model_override
 
     default_model = os.getenv("DEFAULT_MODEL", "llama3.1:8b-instruct-q4_K_M")
-
     if not subject:
         return default_model
 
-    # "hard" tier if level suggests college/AP/advanced
     is_hard = False
     if level:
         lvl = level.lower()
-        is_hard = any(k in lvl for k in ("college", "ap", "advanced", "university"))
+        is_hard = any(k in lvl for k in ["college", "ap", "advanced"])
 
-    def pick(env_base: str) -> str:
-        if is_hard:
-            hard = os.getenv(f"{env_base}_HARD")
-            if hard and hard.strip():
-                return hard.strip()
-        return os.getenv(env_base, default_model) or default_model
+    if subject in [SubjectType.MATH, SubjectType.CS, SubjectType.COMPUTER_SCIENCE]:
+        if is_hard and (m := os.getenv("MATH_CS_MODEL_HARD")):
+            return m
+        return os.getenv("MATH_CS_MODEL", default_model)
 
-    if subject in (SubjectType.MATH, SubjectType.CS, SubjectType.COMPUTER_SCIENCE):
-        return pick("MATH_CS_MODEL")
     if subject == SubjectType.SCIENCE:
-        return pick("SCIENCE_MODEL")
-    if subject in (
-        SubjectType.HUMANITIES,
-        SubjectType.ELA,
-        SubjectType.ENGLISH,
-        SubjectType.HISTORY,
-        SubjectType.SOCIAL,
-        SubjectType.SOCIAL_STUDIES,
-    ):
-        return pick("HUMANITIES_MODEL")
+        if is_hard and (m := os.getenv("SCIENCE_MODEL_HARD")):
+            return m
+        return os.getenv("SCIENCE_MODEL", default_model)
+
+    if subject in [SubjectType.HUMANITIES, SubjectType.ELA, SubjectType.ENGLISH,
+                   SubjectType.HISTORY, SubjectType.SOCIAL, SubjectType.SOCIAL_STUDIES]:
+        if is_hard and (m := os.getenv("HUMANITIES_MODEL_HARD")):
+            return m
+        return os.getenv("HUMANITIES_MODEL", default_model)
 
     return default_model
 
 
-# ---------- Tutor instance ----------
+# Init tutor
 tutor = ErgoAITutor()
+
+
+# Warm models on startup (so first real call doesn't time out)
+@app.on_event("startup")
+async def _warm_models():
+    try:
+        await tutor.warm_up()
+    except Exception:
+        # don't block startup if warm-up fails
+        pass
+
 
 # ---------- Endpoints ----------
 @app.get("/health")
@@ -193,7 +187,7 @@ async def ask_question(req: QuestionRequest, _=Depends(rate_limit_dependency)):
         answer = await tutor.get_answer(
             req.question,
             model=model_to_use,
-            user_id=req.user_id
+            user_id=req.user_id,  # <— pass through for context/warmth
         )
         return AnswerResponse(model_used=model_to_use, answer=answer)
     except httpx.TimeoutException:
@@ -230,7 +224,6 @@ async def dev_stats():
 
 if __name__ == "__main__":
     import uvicorn
-
     host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host=host, port=port)
