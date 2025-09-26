@@ -1,67 +1,32 @@
-# Use GHCR mirror of the Python base image (avoids Docker Hub pulls)
-FROM ghcr.io/library/python:3.11-slim
-
-# Use bash with pipefail for safer installs
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 WORKDIR /app
 
-# -------- System deps --------
-RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    ca-certificates \
+# --- System dependencies for wheels/builds ---
+# - build-essential: gcc/make for building native extensions
+# - libssl-dev, libffi-dev: required by cryptography / bcrypt
+# - curl: used by healthchecks or debugging
+# - pkg-config: safer builds for some packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libssl-dev libffi-dev pkg-config curl \
  && rm -rf /var/lib/apt/lists/*
 
-# -------- Python deps --------
+# --- Python deps ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# -------- App code --------
-COPY . .
+# --- App files ---
+COPY server.py ergo_ai_tutor.py platform_bridge.py ergo_system_prompt.txt ./
 
-# Make the system prompt path explicit (your code will auto-read this)
-ENV ERGO_SYSTEM_PROMPT_PATH=/app/ergo_system_prompt.txt
+# --- Environment defaults (override with .env or compose) ---
+ENV HOST=0.0.0.0
+ENV PORT=8000
+# If running with docker-compose + Ollama service, override to http://ollama:11434
+ENV OLLAMA_URL=http://127.0.0.1:11434
+ENV OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M
+ENV DEFAULT_MODEL=llama3.1:8b-instruct-q4_K_M
+ENV OLLAMA_TIMEOUT=90
 
-# Ollama + tutor defaults (match your backend)
-ENV OLLAMA_URL=http://127.0.0.1:11434 \
-    OLLAMA_MODEL=llama3.1:8b-instruct-q4_K_M \
-    OLLAMA_TIMEOUT=60 \
-    OLLAMA_MAX_TOKENS=500 \
-    OLLAMA_TEMP=0.7
-
-# -------- Install Ollama in the image --------
-RUN curl -fsSL https://ollama.com/install.sh | sh
-
-# -------- Startup script --------
-# Waits for Ollama, pulls model if needed, then launches your server
-RUN printf '%s\n' \
-'#!/usr/bin/env bash' \
-'set -euo pipefail' \
-'' \
-'# Start Ollama in background' \
-'ollama serve &>/tmp/ollama.log &' \
-'' \
-'# Wait for Ollama HTTP to be available' \
-'for i in {1..60}; do' \
-'  if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then' \
-'    break' \
-'  fi' \
-'  sleep 1' \
-'done' \
-'' \
-'# Pull the configured model (idempotent)' \
-'MODEL="${OLLAMA_MODEL:-llama3.1:8b-instruct-q4_K_M}"' \
-'ollama pull "$MODEL" || true' \
-'' \
-'# Launch FastAPI app (adjust if your entry is different)' \
-'exec python3 server_platform.py' \
-> /app/start.sh && chmod +x /app/start.sh
-
+# --- Expose API port ---
 EXPOSE 8000
 
-# Healthcheck against your /health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD curl -fsS http://localhost:8000/health || exit 1
-
-CMD ["/app/start.sh"]
+# --- Start the API ---
+CMD ["python", "server.py"]
