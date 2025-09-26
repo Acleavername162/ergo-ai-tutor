@@ -1,11 +1,23 @@
 # Ergo AI Tutor API
 
-Dual-model AI tutoring service with subject-based routing. Qwen for MATH/CS/SCIENCE, Llama for HUMANITIES/ELA/HISTORY, with per-request overrides.
+FastAPI service for Project RISE that talks to **Ollama** (local LLM), with:
+- Secure API key enforcement
+- CORS controls
+- SQLite persistence (simple bridge)
+- Docker & Docker Compose support
+- Per-user short conversation memory (configurable)
 
-## Quick Start
+---
 
-### 1) Create venv & install
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+## Repository Layout
+ergo-ai/
+├─ server.py # FastAPI app (entrypoint)
+├─ ergo_ai_tutor.py # Tutor + Ollama client (routing, retries, memory)
+├─ platform_bridge.py # Synchronous SQLite helper
+├─ ergo_system_prompt.txt # System prompt for Ergo
+├─ requirements.txt # Full-stack Python deps
+├─ Dockerfile # Full-stack build (cryptography/bcrypt ready)
+├─ docker-compose.yml # Ollama + API stack
+├─ .env.example # Copy to .env on server, set real secrets
+├─ .gitignore
+└─ .replit # Optional local run config for Replit
