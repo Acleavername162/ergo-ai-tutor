@@ -190,7 +190,11 @@ async def start_session(req: SessionStartRequest, _=Depends(rate_limit_dependenc
 async def ask_question(req: QuestionRequest, _=Depends(rate_limit_dependency)):
     model_to_use = get_model_for_request(req.subject, req.level, req.model)
     try:
-        answer = await tutor.get_answer(req.question, model=model_to_use)
+        answer = await tutor.get_answer(
+            req.question,
+            model=model_to_use,
+            user_id=req.user_id
+        )
         return AnswerResponse(model_used=model_to_use, answer=answer)
     except httpx.TimeoutException:
         raise HTTPException(status_code=502, detail="Ollama service timeout — please try again")
