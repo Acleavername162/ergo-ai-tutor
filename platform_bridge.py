@@ -1,220 +1,151 @@
-"""
-Platform Bridge - Connects Ollama AI to platform data
-Handles user authentication, data access, and platform integration
-"""
-
 import os
-import requests
-import json
-from typing import Dict, List, Optional, Any
-from datetime import datetime
 import sqlite3
-import asyncio
+from typing import Optional, List, Dict, Any
+
 
 class PlatformBridge:
-    """Bridge between Ollama AI and platform data"""
-    
-    def __init__(self):
-        self.platform_url = os.getenv("PLATFORM_URL", "https://your-platform.com")
-        self.api_key = os.getenv("PLATFORM_API_KEY", "")
-        self.db_path = os.getenv("PLATFORM_DB_PATH", "./platform.db")
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize platform database connection"""
+    """
+    Minimal, synchronous SQLite helper for Project RISE.
+
+    Usage (from async FastAPI endpoints):
+        bridge = PlatformBridge()  # or pass a custom db_path
+        rows = await asyncio.to_thread(bridge.get_progress, user_id)
+
+    Tables:
+      - user_profile(user_id TEXT PRIMARY KEY, name TEXT, created_at TIMESTAMP)
+      - progress(user_id TEXT, course_id TEXT, lesson_id TEXT, status TEXT, updated_at TIMESTAMP)
+
+    Notes:
+      - This module is intentionally synchronous for simplicity and reliability.
+      - Call its methods with `asyncio.to_thread(...)` from async contexts.
+      - The DB file path is controlled by PLATFORM_DB_PATH or defaults to ./data/platform.db
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = db_path or os.getenv("PLATFORM_DB_PATH", "./data/platform.db")
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        self._init_db()
+
+    # -------- internal helpers --------
+    def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Create tables for platform data
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                email TEXT,
-                name TEXT,
-                grade_level INTEGER,
-                learning_style TEXT,
-                subscription_tier TEXT,
-                created_at TIMESTAMP
+        conn.row_factory = sqlite3.Row  # return rows as dict-like
+        return conn
+
+    def _init_db(self) -> None:
+        with self._conn() as cx:
+            cx.execute("""
+                CREATE TABLE IF NOT EXISTS user_profile (
+                    user_id    TEXT PRIMARY KEY,
+                    name       TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cx.execute("""
+                CREATE TABLE IF NOT EXISTS progress (
+                    user_id    TEXT    NOT NULL,
+                    course_id  TEXT    NOT NULL,
+                    lesson_id  TEXT    NOT NULL,
+                    status     TEXT    NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, course_id, lesson_id)
+                )
+            """)
+            cx.commit()
+
+    # -------- user profile --------
+    def upsert_user(self, user_id: str, name: Optional[str] = None) -> None:
+        """
+        Create or update a user profile.
+        """
+        with self._conn() as cx:
+            cx.execute(
+                """
+                INSERT INTO user_profile (user_id, name)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET name=excluded.name
+                """,
+                (user_id, name),
             )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS courses (
-                id TEXT PRIMARY KEY,
-                title TEXT,
-                subject TEXT,
-                difficulty TEXT,
-                content TEXT,
-                prerequisites TEXT,
-                created_at TIMESTAMP
+            cx.commit()
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Return a single user profile as a dict, or None if not found.
+        """
+        with self._conn() as cx:
+            cur = cx.execute(
+                "SELECT user_id, name, created_at FROM user_profile WHERE user_id = ?",
+                (user_id,),
             )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_progress (
-                user_id TEXT,
-                course_id TEXT,
-                lesson_id TEXT,
-                completion_percentage REAL,
-                last_accessed TIMESTAMP,
-                PRIMARY KEY (user_id, course_id, lesson_id)
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    # -------- progress tracking --------
+    def set_progress(self, user_id: str, course_id: str, lesson_id: str, status: str) -> None:
+        """
+        Insert or update a user's progress for a lesson.
+        Status is an arbitrary string (e.g., 'started', 'completed', 'review').
+        """
+        with self._conn() as cx:
+            cx.execute(
+                """
+                INSERT INTO progress (user_id, course_id, lesson_id, status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, course_id, lesson_id)
+                DO UPDATE SET status=excluded.status, updated_at=CURRENT_TIMESTAMP
+                """,
+                (user_id, course_id, lesson_id, status),
             )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chat_history (
-                id TEXT PRIMARY KEY,
-                user_id TEXT,
-                message TEXT,
-                ai_response TEXT,
-                context TEXT,
-                timestamp TIMESTAMP
+            cx.commit()
+
+    def get_progress(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Return all progress rows for a user, newest first.
+        """
+        with self._conn() as cx:
+            cur = cx.execute(
+                """
+                SELECT user_id, course_id, lesson_id, status, updated_at
+                FROM progress
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
             )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    async def get_user_profile(self, user_id: str) -> Optional[Dict]:
-        """Get user profile and learning data"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, email, name, grade_level, learning_style, subscription_tier
-            FROM users WHERE id = ?
-        ''', (user_id,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return {
-                "user_id": result[0],
-                "email": result[1],
-                "name": result[2],
-                "grade_level": result[3],
-                "learning_style": result[4],
-                "subscription_tier": result[5]
-            }
-        return None
-    
-    async def get_user_progress(self, user_id: str) -> List[Dict]:
-        """Get user's learning progress across all courses"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT p.course_id, p.lesson_id, p.completion_percentage, 
-                   p.last_accessed, c.title, c.subject
-            FROM user_progress p
-            JOIN courses c ON p.course_id = c.id
-            WHERE p.user_id = ?
-            ORDER BY p.last_accessed DESC
-        ''', (user_id,))
-        
-        results = cursor.fetchall()
-        conn.close()
-        
-        return [{
-            "course_id": row[0],
-            "lesson_id": row[1],
-            "completion_percentage": row[2],
-            "last_accessed": row[3],
-            "course_title": row[4],
-            "subject": row[5]
-        } for row in results]
-    
-    async def get_course_content(self, course_id: str) -> Optional[Dict]:
-        """Get course content and structure"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, title, subject, difficulty, content, prerequisites
-            FROM courses WHERE id = ?
-        ''', (course_id,))
-        
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result:
-            return {
-                "course_id": result[0],
-                "title": result[1],
-                "subject": result[2],
-                "difficulty": result[3],
-                "content": json.loads(result[4]) if result[4] else {},
-                "prerequisites": result[5].split(',') if result[5] else []
-            }
-        return None
-    
-    async def save_chat_interaction(self, user_id: str, message: str, ai_response: str, context: Dict = None):
-        """Save chat interaction for learning analytics"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        chat_id = f"{user_id}_{datetime.now().timestamp()}"
-        
-        cursor.execute('''
-            INSERT INTO chat_history (id, user_id, message, ai_response, context, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            chat_id,
-            user_id,
-            message,
-            ai_response,
-            json.dumps(context) if context else "{}",
-            datetime.now()
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    async def update_user_progress(self, user_id: str, course_id: str, lesson_id: str, completion: float):
-        """Update user's progress in a course"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO user_progress 
-            (user_id, course_id, lesson_id, completion_percentage, last_accessed)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, course_id, lesson_id, completion, datetime.now()))
-        
-        conn.commit()
-        conn.close()
-    
-    async def get_recommended_content(self, user_id: str) -> List[Dict]:
-        """Get AI-recommended content based on user progress"""
-        user_profile = await self.get_user_profile(user_id)
-        user_progress = await self.get_user_progress(user_id)
-        
-        if not user_profile:
-            return []
-        
-        # Simple recommendation logic - you can enhance this
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Find courses matching user's grade level that they haven't completed
-        completed_courses = {p["course_id"] for p in user_progress if p["completion_percentage"] >= 90}
-        
-        cursor.execute('''
-            SELECT id, title, subject, difficulty
-            FROM courses 
-            WHERE id NOT IN ({})
-            ORDER BY title
-            LIMIT 5
-        '''.format(','.join(['?' for _ in completed_courses])), list(completed_courses))
-        
-        recommendations = cursor.fetchall()
-        conn.close()
-        
-        return [{
-            "course_id": row[0],
-            "title": row[1],
-            "subject": row[2],
-            "difficulty": row[3],
-            "reason": "Recommended based on your learning progress"
-        } for row in recommendations]
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_course_progress(self, user_id: str, course_id: str) -> List[Dict[str, Any]]:
+        """
+        Return progress rows for a specific course, newest first.
+        """
+        with self._conn() as cx:
+            cur = cx.execute(
+                """
+                SELECT user_id, course_id, lesson_id, status, updated_at
+                FROM progress
+                WHERE user_id = ? AND course_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id, course_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def delete_progress(self, user_id: str, course_id: Optional[str] = None) -> int:
+        """
+        Delete progress entries for a user; optionally limit to a specific course.
+        Returns number of rows deleted.
+        """
+        with self._conn() as cx:
+            if course_id:
+                cur = cx.execute(
+                    "DELETE FROM progress WHERE user_id = ? AND course_id = ?",
+                    (user_id, course_id),
+                )
+            else:
+                cur = cx.execute(
+                    "DELETE FROM progress WHERE user_id = ?",
+                    (user_id,),
+                )
+            cx.commit()
+            return cur.rowcount
