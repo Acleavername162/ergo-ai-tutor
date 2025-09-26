@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+import logging
 from collections import defaultdict
 from typing import Optional
 
@@ -16,13 +17,30 @@ from ergo_ai_tutor import ErgoAITutor
 # -------------------------
 load_dotenv()
 
+# Require security-critical env vars
+API_KEY = os.getenv("API_KEY", "").strip()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "").strip()
+if len(API_KEY) < 24:
+    raise RuntimeError("API_KEY must be set to a strong value (>= 24 chars).")
+if len(JWT_SECRET_KEY) < 32:
+    raise RuntimeError("JWT_SECRET_KEY must be set to a strong value (>= 32 chars).")
+
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Comma-separated list of origins in .env (e.g., "https://ai.therisehub.org,http://localhost:3000")
-allowed_origins = [
-    o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()
-]
+# CORS: explicit origins; include local dev by default if none provided
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _raw_origins:
+    allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    allowed_origins = ["http://localhost:3000", "http://localhost:5173"]
+
+# Logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("ergo-api")
 
 app = FastAPI(
     title="Ergo AI Tutor API",
@@ -32,7 +50,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins or ["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,15 +59,11 @@ app.add_middleware(
 # -------------------------
 # Simple Rate Limiter
 # -------------------------
-RATE_LIMIT_REQUESTS = 30
-RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 _rate_buckets = defaultdict(list)
 
 def rate_limit_dependency(request: Request):
-    """
-    Very lightweight, in-memory IP-based rate limiter.
-    Exempts OPTIONS, /health, /docs, /openapi.json.
-    """
     path = request.url.path
     if request.method == "OPTIONS" or path in ("/health", "/docs", "/openapi.json"):
         return
@@ -58,7 +72,6 @@ def rate_limit_dependency(request: Request):
     ip = request.client.host if request.client else "unknown"
     bucket = _rate_buckets[ip]
 
-    # Drop old timestamps out of the window
     cutoff = now - RATE_LIMIT_WINDOW
     while bucket and bucket[0] < cutoff:
         bucket.pop(0)
@@ -69,18 +82,11 @@ def rate_limit_dependency(request: Request):
     bucket.append(now)
 
 # -------------------------
-# Optional API Key Guard
+# API Key Guard (always enforced)
 # -------------------------
 def require_api_key(request: Request):
-    """
-    Enforce X-API-Key only if API_KEY is set in the environment.
-    If API_KEY is empty/unset, this becomes a no-op (open endpoint).
-    """
-    expected = os.getenv("API_KEY", "").strip()
-    if not expected:
-        return  # no API key configured → do not enforce
     provided = request.headers.get("X-API-Key", "").strip()
-    if provided != expected:
+    if provided != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 # -------------------------
@@ -104,10 +110,15 @@ tutor = ErgoAITutor()
 
 @app.on_event("startup")
 async def _startup():
-    # Ensure local data folder for sqlite, logs, etc.
     os.makedirs("data", exist_ok=True)
-    # Warm up Ollama health (non-fatal if it fails)
     await tutor.warmup()
+    try:
+        info = await asyncio.to_thread(tutor.ai_backend.health)
+        models = info.get("models") or info  # shape differs across Ollama versions
+        count = len(models) if isinstance(models, list) else 0
+        log.info("Connected to Ollama at %s (models: %s)", tutor.ai_backend.base_url, count)
+    except Exception as e:
+        log.warning("Ollama health check failed on startup: %s", e)
 
 # -------------------------
 # Routes
@@ -115,15 +126,27 @@ async def _startup():
 @app.get("/health")
 async def health():
     """
-    Lightweight liveness/readiness endpoint.
+    Liveness/readiness. Returns Ollama status too.
     """
-    return {"status": "ok"}
+    ok = True
+    ollama_ok = False
+    models_count = 0
+    try:
+        info = await asyncio.to_thread(tutor.ai_backend.health)
+        models = info.get("models") or info
+        if isinstance(models, list):
+            models_count = len(models)
+        ollama_ok = True
+    except Exception:
+        ok = False
 
-@app.get("/dev/ollama")
+    return {
+        "status": "ok" if ok else "degraded",
+        "ollama": {"ok": ollama_ok, "url": tutor.ai_backend.base_url, "models_count": models_count},
+    }
+
+@app.get("/dev/ollama", dependencies=[Depends(require_api_key)])
 async def dev_ollama():
-    """
-    Debug endpoint to verify Ollama connectivity and list pulled models.
-    """
     try:
         data = await asyncio.to_thread(tutor.ai_backend.health)
         return {"ollama_url": tutor.ai_backend.base_url, "models": data}
@@ -136,10 +159,6 @@ async def dev_ollama():
     dependencies=[Depends(rate_limit_dependency), Depends(require_api_key)],
 )
 async def ask_question(req: QuestionRequest):
-    """
-    Main tutor endpoint. Passes through subject/level and optional model.
-    Enforces API key if API_KEY is set in .env.
-    """
     try:
         answer = await tutor.get_answer(
             req.question,
