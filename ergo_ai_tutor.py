@@ -7,10 +7,10 @@ import requests
 import re
 import string
 from typing import Dict, List, Optional, Any, Union
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from enum import Enum
 from datetime import datetime
-from pathlib import Path  # <-- added
+from pathlib import Path
 
 # --- System prompt loading ---
 _DEFAULT_PROMPT = (
@@ -27,14 +27,11 @@ def get_system_prompt() -> str:
     if _PROMPT_CACHE:
         return _PROMPT_CACHE
 
-    # Allow override via env var
     override = os.getenv("ERGO_SYSTEM_PROMPT_PATH")
     search_order = []
     if override:
         search_order.append(Path(override))
-    # next to this file (repo root if file lives there)
     search_order.append(Path(__file__).with_name("ergo_system_prompt.txt"))
-    # current working dir (just in case)
     search_order.append(Path.cwd() / "ergo_system_prompt.txt")
 
     for p in search_order:
@@ -45,7 +42,6 @@ def get_system_prompt() -> str:
                     _PROMPT_CACHE = txt
                     return _PROMPT_CACHE
         except Exception:
-            # ignore read errors and keep searching
             pass
 
     _PROMPT_CACHE = _DEFAULT_PROMPT
@@ -138,31 +134,21 @@ class OllamaAIBackend:
     ) -> None:
         self.base_url = os.getenv("OLLAMA_URL", os.getenv("OLLAMA_BASE_URL", base_url)).rstrip("/")
         self.model = os.getenv("OLLAMA_MODEL", model)
-        self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "60"))
-        self.max_tokens = int(os.getenv("OLLAMA_MAX_TOKENS", "500"))
-        self.temperature = float(os.getenv("OLLAMA_TEMP", "0.7"))
-        # conversation_history: user_id -> List[ {timestamp, question, answer} ]
+
+        # Tunables (safe CPU defaults)
+        self.timeout = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+        self.max_tokens = int(os.getenv("OLLAMA_MAX_TOKENS", "160"))
+        self.temperature = float(os.getenv("OLLAMA_TEMP", "0.6"))
+        self.top_p = float(os.getenv("OLLAMA_TOP_P", "0.9"))
+
+        # conversation_history: user_id -> List[{timestamp, question, answer}]
         self.conversation_history: Dict[str, List[Dict[str, str]]] = {}
 
-    def _extract_first_json_block(self, text: str) -> Optional[dict]:
-        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-        blob = m.group(1) if m else None
-        if not blob:
-            start, end = text.find("{"), text.rfind("}")
-            blob = text[start : end + 1] if (start != -1 and end > start) else None
-        if not blob:
-            return None
-        try:
-            return json.loads(blob)
-        except Exception:
-            return None
-
     async def _post(self, url: str, json_data: Dict[str, Any], timeout: int):
-        # run requests.post in a thread to avoid blocking the event loop
+        """Run requests.post in a thread to avoid blocking the event loop."""
         return await asyncio.to_thread(requests.post, url, json=json_data, timeout=timeout)
 
     def _build_context_prompt(self, prompt: str, user_id: str, context: Optional[Dict[str, Any]]) -> str:
-        # Pull system voice from file/env with default fallback
         base_personality = get_system_prompt()
 
         current_context = ""
@@ -200,25 +186,24 @@ class OllamaAIBackend:
         return self.conversation_history.get(user_id, [])[-limit:]
 
     async def chat(self, prompt: str, user_id: str, context: Optional[Dict[str, Any]] = None) -> str:
-        """Main chat interface with context awareness, non-blocking calls and retry logic."""
+        """Main chat interface with context awareness, retries, and CPU-friendly options."""
         full_prompt = self._build_context_prompt(prompt, user_id, context)
+
+        payload = {
+            "model": self.model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "num_predict": self.max_tokens,
+            },
+            "keep_alive": "10m",
+        }
+
         for attempt in range(3):
             try:
-                response = await self._post(
-                    f"{self.base_url}/api/generate",
-                    {
-                        "model": self.model,
-                        "prompt": full_prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": self.temperature,
-                            "top_p": 0.9,
-                            "num_predict": self.max_tokens,
-                        },
-                        "keep_alive": "5m",
-                    },
-                    self.timeout,
-                )
+                response = await self._post(f"{self.base_url}/api/generate", payload, self.timeout)
                 if response.status_code == 200:
                     result = response.json()
                     ai_response = (result.get("response") or "").strip()
@@ -226,9 +211,8 @@ class OllamaAIBackend:
                         ai_response = "I’m here—try asking that again with a bit more detail."
                     self._update_conversation_history(user_id, prompt, ai_response)
                     return ai_response
-                # non-200 → fall through to retry
             except Exception:
-                await asyncio.sleep(0.5 * (2**attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt))
 
         return "I'm having a small hiccup or trouble connecting. Please try again, or type /switch <subject> : <subtopic>."
 
@@ -241,23 +225,47 @@ class ErgoAITutor:
     """Main Ergo AI Tutor class with input router and robust handling."""
 
     def __init__(self) -> None:
-        # Tests expect this name:
         self.ai_backend = OllamaAIBackend()
         self.active_sessions: Dict[str, TutoringSession] = {}
 
-    # ---------- NEW: compatibility wrapper for API /tutor/question ----------
+        # Models to pre-warm so first real request isn't slow
+        self.warm_models: List[str] = [
+            m.strip() for m in os.getenv(
+                "WARM_MODELS",
+                "qwen2.5:7b-instruct-q4_0,llama3.1:8b-instruct-q4_K_M"
+            ).split(",") if m.strip()
+        ]
+
+    # ---------- used by server.py on startup ----------
+    async def warm_up(self) -> None:
+        """Pre-hit Ollama with tiny prompts for each warm model. Best-effort, non-fatal."""
+        for m in self.warm_models:
+            try:
+                payload = {
+                    "model": m,
+                    "prompt": "ready",
+                    "stream": False,
+                    "keep_alive": "10m",
+                    "options": {"num_predict": 8, "temperature": 0.0},
+                }
+                await self.ai_backend._post(f"{self.ai_backend.base_url}/api/generate", payload, timeout=30)
+            except Exception:
+                # ignore warmup failures; service should still run
+                pass
+
+    # ---------- compatibility wrapper for /tutor/question ----------
     async def get_answer(self, question: str, model: Optional[str] = None, user_id: str = "anonymous") -> str:
         """
-        Compatibility shim used by server.py. Optionally override the model for this call,
-        then delegate to the backend chat while preserving the previous model setting.
+        Optionally override the model for this call, then delegate to the backend chat
+        while restoring the previous model afterwards.
         """
         prev_model = self.ai_backend.model
         try:
             if model:
                 self.ai_backend.model = model
-            return await self.ai_backend.chat(question=question, user_id=user_id, context=None)
+            # If you later add session context, pass it here:
+            return await self.ai_backend.chat(question, user_id, context=None)
         finally:
-            # restore whatever the backend was using before
             self.ai_backend.model = prev_model
 
     # ---------- helpers ----------
@@ -340,7 +348,6 @@ class ErgoAITutor:
             last_interaction=datetime.now(),
         )
 
-        # build welcome via LLM but tolerate errors
         welcome_prompt = (
             f"Welcome {user_profile.name} to learning about {subtopic} in {subject_str}! "
             f"Introduce yourself as Ergo and ask what they'd like to start with."
@@ -361,7 +368,6 @@ class ErgoAITutor:
                 f"Let's explore {subtopic} together. What would you like to start with?"
             )
 
-        # session_context shape expected by tests
         session = self.active_sessions[user_profile.user_id]
         session_context = {
             "session_id": user_profile.user_id,
@@ -422,7 +428,6 @@ class ErgoAITutor:
                     ),
                 }
 
-            # On-topic → call LLM
             try:
                 response = await self.ai_backend.chat(
                     question,
@@ -482,7 +487,6 @@ class ErgoAITutor:
         """Serialize UserProfile with enum values expanded."""
         data = asdict(profile)
         data["learning_style"] = profile.learning_style.value
-        # Keep everything else as-is
         return data
 
 
